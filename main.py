@@ -2,7 +2,7 @@
 import logging
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from config import BOT_TOKEN, SUPER_ADMIN_ID
 from database import init_db, add_admin, is_admin
 
@@ -42,7 +42,7 @@ MAIN_MENU_KEYBOARD = [
     [InlineKeyboardButton("📋 Мои баги", callback_data="my_bugs_menu")],
 ]
 
-async def start(update: Update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     username = update.effective_user.username or f"user{user_id}"
 
@@ -83,7 +83,7 @@ async def start(update: Update, context):
         reply_markup=reply_markup
     )
 
-async def my_bugs_menu(update: Update, context):
+async def my_bugs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
@@ -97,7 +97,7 @@ async def my_bugs_menu(update: Update, context):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.message.reply_text("🐞 Мои баги:", reply_markup=reply_markup)
 
-async def admin_bugs_menu(update: Update, context):
+async def admin_bugs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
@@ -116,18 +116,18 @@ async def admin_bugs_menu(update: Update, context):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.message.reply_text("🐛 Все баги (админ):", reply_markup=reply_markup)
 
-async def get_user_id(update: Update, context):
+async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(f"🔑 Ваш Telegram ID: `{user.id}`", parse_mode="Markdown")
 
-async def open_admin_panel_command(update: Update, context):
+async def open_admin_panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != SUPER_ADMIN_ID:
         await update.message.reply_text("⛔ Только суперадмин может управлять админами.")
         return
     await admin_panel(update, context)
 
-async def cancel_any_process(update: Update, context):
+async def cancel_any_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     # Импортируем состояния
@@ -151,7 +151,7 @@ async def cancel_any_process(update: Update, context):
     else:
         await update.message.reply_text("ℹ️ Нет активного процесса.")
 
-async def button_handler(update: Update, context):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -195,7 +195,7 @@ async def button_handler(update: Update, context):
     elif data.startswith("app_approve_") or data.startswith("app_reject_"):
         await handle_application_action(update, context)
 
-async def handle_text_input(update: Update, context):
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     from task_system import USER_DATA as TASK_USER_DATA
@@ -237,7 +237,7 @@ async def handle_text_input(update: Update, context):
 
     await update.message.reply_text("ℹ️ Начните с команды /start")
 
-async def handle_media_input(update: Update, context):
+async def handle_media_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     from task_system import USER_DATA as TASK_USER_DATA
@@ -258,8 +258,6 @@ async def handle_media_input(update: Update, context):
 async def main():
     # Инициализация БД
     await init_db()
-    await add_admin(SUPER_ADMIN_ID, "@superadmin")
-    logger.info(f"✅ Суперадмин (ID: {SUPER_ADMIN_ID}) добавлен при запуске.")
 
     # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
@@ -285,8 +283,14 @@ async def main():
 
     logger.info("✅ Бот запущен и готов к работе.")
     
-    # Запускаем бота
-    await application.run_polling()
+    # Запускаем бота с обработкой ошибок
+    try:
+        await application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True
+        )
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
+        raise
 
 if __name__ == "__main__":
-    asyncio.run(main())
