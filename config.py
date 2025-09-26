@@ -5,4 +5,4 @@ SUPER_ADMIN_ID = 6218262975
 GROUP_CHAT_ID = -1003072388859
 
 TOPIC_THREAD_ID_BUGS = 2          # Тема для багов
-TOPIC_THREAD_ID_APPS = 54        # ← ЗАМЕНИТЕ на реальный Thread ID темы "Заявки"!
+TOPIC_THREAD_ID_APPS = 54         # Тема для заявок
