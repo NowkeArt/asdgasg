@@ -1,16 +1,28 @@
-# main.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import logging
 import asyncio
+import aiosqlite
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from config import BOT_TOKEN, SUPER_ADMIN_ID, GROUP_CHAT_ID, TOPIC_THREAD_ID_BUGS, TOPIC_THREAD_ID_APPS
-from database import *
 
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Конфигурация
+BOT_TOKEN = "8290467227:AAHiYdY7RO8uJ9yB3Z3uA3h7ibwWJJW84B0"
+SUPER_ADMIN_ID = 6218262975
+GROUP_CHAT_ID = -1003072388859
+TOPIC_THREAD_ID_BUGS = 2
+TOPIC_THREAD_ID_APPS = 54
+
+DB_PATH = "tasks.db"
 
 # Глобальные переменные для FSM
 USER_DATA = {}
@@ -29,12 +41,228 @@ QUESTIONS = [
     "7. Время, которое вы готовы выделять на сервер в день (можно указать промежуток времени и дни)."
 ]
 
-# Главное меню
+# === БАЗА ДАННЫХ ===
+
+async def init_db():
+    """Инициализация базы данных"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Админы
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Технические задания
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id INTEGER NOT NULL,
+                author_username TEXT NOT NULL,
+                description TEXT NOT NULL,
+                media_file_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                assigned_admin_id INTEGER,
+                assigned_admin_username TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Баги
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bugs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id INTEGER NOT NULL,
+                author_username TEXT NOT NULL,
+                description TEXT NOT NULL,
+                media_file_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                assigned_admin_id INTEGER,
+                assigned_admin_username TEXT,
+                message_id_in_group INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Заявки в команду
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                position TEXT NOT NULL,
+                timezone TEXT,
+                moderation_experience TEXT,
+                other_projects TEXT,
+                cheat_check_knowledge TEXT,
+                grif_experience TEXT,
+                age TEXT,
+                available_time TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                message_id_in_group INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+        logger.info("✅ База данных инициализирована")
+
+async def add_admin(user_id: int, username: str):
+    """Добавить администратора"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO admins (user_id, username) VALUES (?, ?)",
+            (user_id, username)
+        )
+        await db.commit()
+        logger.info(f"✅ Добавлен админ: {username} (ID: {user_id})")
+
+async def is_admin(user_id: int) -> bool:
+    """Проверить, является ли пользователь администратором"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
+async def get_admins():
+    """Получить список всех администраторов"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, username FROM admins") as cursor:
+            return await cursor.fetchall()
+
+# === ФУНКЦИИ ДЛЯ ТЗ ===
+
+async def create_task(author_id: int, author_username: str, description: str, media_file_id: str = None):
+    """Создать новое ТЗ"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO tasks (author_id, author_username, description, media_file_id)
+               VALUES (?, ?, ?, ?)""",
+            (author_id, author_username, description, media_file_id)
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cursor:
+            row = await cursor.fetchone()
+            return row[0]
+
+async def update_task_status(task_id: int, status: str, admin_id: int, admin_username: str):
+    """Обновить статус ТЗ"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """UPDATE tasks SET status = ?, assigned_admin_id = ?, assigned_admin_username = ?, 
+               updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+            (status, admin_id, admin_username, task_id)
+        )
+        await db.commit()
+
+async def get_task_by_id(task_id: int):
+    """Получить ТЗ по ID"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ) as cursor:
+            return await cursor.fetchone()
+
+# === ФУНКЦИИ ДЛЯ БАГОВ ===
+
+async def create_bug(author_id: int, author_username: str, description: str, media_file_id: str = None):
+    """Создать новый баг"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO bugs (author_id, author_username, description, media_file_id)
+               VALUES (?, ?, ?, ?)""",
+            (author_id, author_username, description, media_file_id)
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cursor:
+            row = await cursor.fetchone()
+            return row[0]
+
+async def update_bug_status(bug_id: int, status: str, admin_id: int, admin_username: str, message_id_in_group: int = None):
+    """Обновить статус бага"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if message_id_in_group:
+            await db.execute(
+                """UPDATE bugs SET status = ?, assigned_admin_id = ?, assigned_admin_username = ?, 
+                   message_id_in_group = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (status, admin_id, admin_username, message_id_in_group, bug_id)
+            )
+        else:
+            await db.execute(
+                """UPDATE bugs SET status = ?, assigned_admin_id = ?, assigned_admin_username = ?, 
+                   updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                (status, admin_id, admin_username, bug_id)
+            )
+        await db.commit()
+
+async def get_bug_by_id(bug_id: int):
+    """Получить баг по ID"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT * FROM bugs WHERE id = ?", (bug_id,)) as cursor:
+            return await cursor.fetchone()
+
+# === ФУНКЦИИ ДЛЯ ЗАЯВОК ===
+
+async def create_application(user_id: int, username: str, position: str, answers: list):
+    """Создать новую заявку"""
+    tz, mod_exp, other_proj, cheat_check, grif_exp, age, time_avail = answers
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT INTO applications
+            (user_id, username, position, timezone, moderation_experience, other_projects,
+             cheat_check_knowledge, grif_experience, age, available_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, username, position, tz, mod_exp, other_proj, cheat_check, grif_exp, age, time_avail)
+        )
+        await db.commit()
+        async with db.execute("SELECT last_insert_rowid()") as cursor:
+            row = await cursor.fetchone()
+            return row[0]
+
+async def get_last_application(user_id: int):
+    """Получить последнюю заявку пользователя"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT * FROM applications WHERE user_id = ? ORDER BY created_at DESC LIMIT 1",
+            (user_id,)
+        ) as cursor:
+            return await cursor.fetchone()
+
+async def update_application_message_id(app_id: int, message_id: int):
+    """Обновить ID сообщения заявки в группе"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE applications SET message_id_in_group = ? WHERE id = ?",
+            (message_id, app_id)
+        )
+        await db.commit()
+
+async def get_application_by_id(app_id: int):
+    """Получить заявку по ID"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT * FROM applications WHERE id = ?", (app_id,)) as cursor:
+            return await cursor.fetchone()
+
+async def update_application_status(app_id: int, status: str):
+    """Обновить статус заявки"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE applications SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, app_id)
+        )
+        await db.commit()
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+
 def get_main_menu_keyboard(is_admin: bool, is_super_admin: bool):
+    """Получить клавиатуру главного меню"""
     keyboard = [
         [InlineKeyboardButton("📄 Создать ТЗ", callback_data="create_task")],
         [InlineKeyboardButton("🐞 Сообщить о баге", callback_data="create_bug")],
-        [InlineKeyboardButton("📋 Мои баги", callback_data="my_bugs_menu")],
     ]
     
     if not is_admin:
@@ -45,7 +273,6 @@ def get_main_menu_keyboard(is_admin: bool, is_super_admin: bool):
             [InlineKeyboardButton("📋 Активные ТЗ", callback_data="list_active")],
             [InlineKeyboardButton("✅ Выполненные ТЗ", callback_data="list_completed")],
             [InlineKeyboardButton("❌ Отклонённые ТЗ", callback_data="list_rejected")],
-            [InlineKeyboardButton("🐛 Админ баги", callback_data="admin_bugs_menu")],
         ])
         
         if is_super_admin:
@@ -53,14 +280,16 @@ def get_main_menu_keyboard(is_admin: bool, is_super_admin: bool):
     
     return keyboard
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === ОБРАБОТЧИКИ КОМАНД ===
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /start"""
     user_id = update.effective_user.id
     username = update.effective_user.username or f"user{user_id}"
 
     # Добавляем суперадмина при первом запуске
     if user_id == SUPER_ADMIN_ID:
         await add_admin(user_id, f"@{username}")
-        logger.info(f"✅ Суперадмин {username} (ID: {user_id}) добавлен при /start.")
 
     is_user_admin = await is_admin(user_id)
     is_super_admin = user_id == SUPER_ADMIN_ID
@@ -73,72 +302,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
+async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Получить ID пользователя"""
+    user = update.effective_user
+    await update.message.reply_text(f"🔑 Ваш Telegram ID: `{user.id}`", parse_mode="Markdown")
+
+async def cancel_any_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменить любой активный процесс"""
+    user_id = update.effective_user.id
+
+    if user_id in USER_DATA:
+        del USER_DATA[user_id]
+        await update.message.reply_text("🚫 Создание ТЗ отменено.")
+    elif user_id in USER_BUG_DATA:
+        del USER_BUG_DATA[user_id]
+        await update.message.reply_text("🚫 Создание бага отменено.")
+    elif user_id in USER_APPLICATION:
+        del USER_APPLICATION[user_id]
+        await update.message.reply_text("🚫 Подача заявки отменена.")
+    elif user_id in ADMIN_USER_DATA:
+        del ADMIN_USER_DATA[user_id]
+        await update.message.reply_text("🚫 Процесс отменён.")
+    else:
+        await update.message.reply_text("ℹ️ Нет активного процесса.")
+
 # === СИСТЕМА ТЗ ===
 
-async def create_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Начать создание ТЗ"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     USER_DATA[user_id] = {'step': 'awaiting_description'}
     await query.message.reply_text("📝 Введите описание задачи:")
 
-async def handle_task_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    USER_DATA[user_id]['description'] = update.message.text
-    USER_DATA[user_id]['step'] = 'awaiting_media'
-    await update.message.reply_text("📸 Прикрепите фото/видео (опционально) или отправьте /skip")
-
-async def handle_task_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        USER_DATA[user_id]['media_file_id'] = file_id
-    elif update.message.video:
-        file_id = update.message.video.file_id
-        USER_DATA[user_id]['media_file_id'] = file_id
-    else:
-        USER_DATA[user_id]['media_file_id'] = None
-
-    await show_task_preview(update, context)
-
-async def skip_task_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in USER_DATA:
-        USER_DATA[user_id]['media_file_id'] = None
-        await show_task_preview(update, context)
-
-async def show_task_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    data = USER_DATA[user_id]
-    
-    desc = data['description']
-    media = data.get('media_file_id')
-
-    text = f"🔍 Предпросмотр ТЗ:\n\n{desc}"
-    keyboard = [
-        [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_task")],
-        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_task")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_task")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if media:
-        if update.message and update.message.photo:
-            await update.message.reply_photo(photo=media, caption=text, reply_markup=reply_markup)
-        elif update.message and update.message.video:
-            await update.message.reply_video(video=media, caption=text, reply_markup=reply_markup)
-        else:
-            await context.bot.send_photo(chat_id=user_id, photo=media, caption=text, reply_markup=reply_markup)
-    else:
-        if update.message:
-            await update.message.reply_text(text, reply_markup=reply_markup)
-        else:
-            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
-
-    USER_DATA[user_id]['step'] = 'preview'
-
-async def confirm_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Подтвердить создание ТЗ"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -149,60 +348,69 @@ async def confirm_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     author_username = update.effective_user.username or "user"
-    task_id = await create_task(
-        author_id=user_id,
-        author_username=f"@{author_username}",
-        description=data['description'],
-        media_file_id=data.get('media_file_id')
-    )
+    
+    try:
+        task_id = await create_task(
+            author_id=user_id,
+            author_username=f"@{author_username}",
+            description=data['description'],
+            media_file_id=data.get('media_file_id')
+        )
 
-    # Отправляем всем админам
-    admins = await get_admins()
-    sent_to_anyone = False
+        # Отправляем всем админам
+        admins = await get_admins()
+        sent_to_anyone = False
 
-    for admin_id, username in admins:
-        try:
-            text = f"📄 Новое ТЗ #{task_id} от @{author_username}:\n\n{data['description']}"
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Выполнить", callback_data=f"complete_{task_id}"),
-                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{task_id}")
+        for admin_id, admin_username in admins:
+            try:
+                text = f"📄 Новое ТЗ #{task_id} от @{author_username}:\n\n{data['description']}"
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ Выполнить", callback_data=f"complete_{task_id}"),
+                        InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{task_id}")
+                    ]
                 ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+                reply_markup = InlineKeyboardMarkup(keyboard)
 
-            if data.get('media_file_id'):
-                await context.bot.send_photo(
-                    chat_id=admin_id,
-                    photo=data['media_file_id'],
-                    caption=text,
-                    reply_markup=reply_markup
-                )
-            else:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=text,
-                    reply_markup=reply_markup
-                )
-            sent_to_anyone = True
-        except Exception as e:
-            logger.warning(f"Не удалось отправить админу {username}: {e}")
+                if data.get('media_file_id'):
+                    await context.bot.send_photo(
+                        chat_id=admin_id,
+                        photo=data['media_file_id'],
+                        caption=text,
+                        reply_markup=reply_markup
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=text,
+                        reply_markup=reply_markup
+                    )
+                sent_to_anyone = True
+            except Exception as e:
+                logger.warning(f"Не удалось отправить админу {admin_username}: {e}")
 
-    if sent_to_anyone:
-        await query.message.reply_text("✅ ТЗ успешно создано и отправлено администраторам!")
-    else:
-        await query.message.reply_text("⚠️ Не удалось отправить ТЗ администраторам.")
+        if sent_to_anyone:
+            await query.message.reply_text("✅ ТЗ успешно создано и отправлено администраторам!")
+        else:
+            await query.message.reply_text("⚠️ Не удалось отправить ТЗ администраторам.")
 
-    del USER_DATA[user_id]
+    except Exception as e:
+        logger.error(f"Ошибка создания ТЗ: {e}")
+        await query.message.reply_text("❌ Не удалось создать ТЗ. Попробуйте позже.")
 
-async def edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if user_id in USER_DATA:
+        del USER_DATA[user_id]
+
+async def edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Изменить ТЗ"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     USER_DATA[user_id] = {'step': 'awaiting_description'}
     await query.message.reply_text("✏️ Введите новое описание задачи:")
 
-async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменить создание ТЗ"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -210,7 +418,8 @@ async def cancel_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del USER_DATA[user_id]
     await query.message.reply_text("🚫 Создание ТЗ отменено.")
 
-async def handle_admin_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_admin_task_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработать действие админа с ТЗ"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -254,70 +463,16 @@ async def handle_admin_task_action(update: Update, context: ContextTypes.DEFAULT
 
 # === СИСТЕМА БАГОВ ===
 
-async def create_bug_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def create_bug_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Начать создание бага"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     USER_BUG_DATA[user_id] = {'step': 'awaiting_description'}
     await query.message.reply_text("🐞 Опишите баг (что сломалось, как воспроизвести):")
 
-async def handle_bug_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    USER_BUG_DATA[user_id]['description'] = update.message.text
-    USER_BUG_DATA[user_id]['step'] = 'awaiting_media'
-    await update.message.reply_text("📸 Прикрепите скриншот/видео (опционально) или отправьте /skip_bug")
-
-async def handle_bug_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        USER_BUG_DATA[user_id]['media_file_id'] = file_id
-    elif update.message.video:
-        file_id = update.message.video.file_id
-        USER_BUG_DATA[user_id]['media_file_id'] = file_id
-    else:
-        USER_BUG_DATA[user_id]['media_file_id'] = None
-
-    await show_bug_preview(update, context)
-
-async def skip_bug_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id in USER_BUG_DATA:
-        USER_BUG_DATA[user_id]['media_file_id'] = None
-        await show_bug_preview(update, context)
-
-async def show_bug_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    data = USER_BUG_DATA[user_id]
-    
-    desc = data['description']
-    media = data.get('media_file_id')
-
-    text = f"🔍 Предпросмотр бага:\n\n{desc}"
-    keyboard = [
-        [InlineKeyboardButton("✅ Отправить", callback_data="confirm_bug")],
-        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_bug")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bug")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if media:
-        if update.message and update.message.photo:
-            await update.message.reply_photo(photo=media, caption=text, reply_markup=reply_markup)
-        elif update.message and update.message.video:
-            await update.message.reply_video(video=media, caption=text, reply_markup=reply_markup)
-        else:
-            await context.bot.send_photo(chat_id=user_id, photo=media, caption=text, reply_markup=reply_markup)
-    else:
-        if update.message:
-            await update.message.reply_text(text, reply_markup=reply_markup)
-        else:
-            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
-
-    USER_BUG_DATA[user_id]['step'] = 'preview'
-
-async def confirm_bug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_bug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Подтвердить создание бага"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -375,14 +530,16 @@ async def confirm_bug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in USER_BUG_DATA:
         del USER_BUG_DATA[user_id]
 
-async def edit_bug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def edit_bug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Изменить баг"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     USER_BUG_DATA[user_id] = {'step': 'awaiting_description'}
     await query.message.reply_text("✏️ Введите новое описание бага:")
 
-async def cancel_bug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_bug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменить создание бага"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -390,7 +547,8 @@ async def cancel_bug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del USER_BUG_DATA[user_id]
     await query.message.reply_text("🚫 Создание бага отменено.")
 
-async def handle_bug_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_bug_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработать действие с багом"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -439,7 +597,7 @@ async def handle_bug_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Не удалось уведомить автора бага {author_id}: {e}")
 
     # Обновляем сообщение в группе
-    message_id_in_group = bug[7]
+    message_id_in_group = bug[8]
     if message_id_in_group:
         try:
             new_text = query.message.text.split("\n\nСтатус:")[0] + f"\n\nСтатус: {emoji} {status}"
@@ -479,110 +637,10 @@ async def handle_bug_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=None
     )
 
-# === МЕНЮ И СПИСКИ ===
-
-async def my_bugs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton("⏳ В ожидании", callback_data="list_bugs_pending")],
-        [InlineKeyboardButton("🛠️ В работе", callback_data="list_bugs_progress")],
-        [InlineKeyboardButton("✅ Исправленные", callback_data="list_bugs_completed")],
-        [InlineKeyboardButton("❌ Отклонённые", callback_data="list_bugs_rejected")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text("🐞 Мои баги:", reply_markup=reply_markup)
-
-async def admin_bugs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    if not await is_admin(user_id):
-        await query.message.reply_text("⛔ У вас нет прав администратора.")
-        return
-    
-    keyboard = [
-        [InlineKeyboardButton("⏳ Все в ожидании", callback_data="list_bugs_pending_all")],
-        [InlineKeyboardButton("🛠️ Все в работе", callback_data="list_bugs_progress_all")],
-        [InlineKeyboardButton("✅ Все исправленные", callback_data="list_bugs_completed_all")],
-        [InlineKeyboardButton("❌ Все отклонённые", callback_data="list_bugs_rejected_all")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text("🐛 Все баги (админ):", reply_markup=reply_markup)
-
-async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = update.effective_user.id
-    is_user_admin = await is_admin(user_id)
-    is_super_admin = user_id == SUPER_ADMIN_ID
-    
-    keyboard = get_main_menu_keyboard(is_user_admin, is_super_admin)
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.reply_text("⬅️ Главное меню:", reply_markup=reply_markup)
-
-# === ОБРАБОТЧИКИ СООБЩЕНИЙ ===
-
-async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    # Обработка ТЗ
-    if user_id in USER_DATA:
-        step = USER_DATA[user_id].get('step')
-        if step == 'awaiting_description':
-            await handle_task_description(update, context)
-            return
-    
-    # Обработка багов
-    if user_id in USER_BUG_DATA:
-        step = USER_BUG_DATA[user_id].get('step')
-        if step == 'awaiting_description':
-            await handle_bug_description(update, context)
-            return
-    
-    # Обработка заявок
-    if user_id in USER_APPLICATION:
-        step = USER_APPLICATION[user_id].get('step')
-        if isinstance(step, int) and 0 <= step < len(QUESTIONS):
-            await handle_application_answer(update, context)
-            return
-    
-    # Обработка админ-панели
-    if user_id in ADMIN_USER_DATA:
-        step = ADMIN_USER_DATA[user_id].get('step')
-        if step == 'awaiting_admin_username':
-            await handle_admin_username(update, context)
-            return
-    
-    await update.message.reply_text("ℹ️ Начните с команды /start")
-
-async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    # Обработка медиа для ТЗ
-    if user_id in USER_DATA:
-        step = USER_DATA[user_id].get('step')
-        if step == 'awaiting_media':
-            await handle_task_media(update, context)
-            return
-    
-    # Обработка медиа для багов
-    if user_id in USER_BUG_DATA:
-        step = USER_BUG_DATA[user_id].get('step')
-        if step == 'awaiting_media':
-            await handle_bug_media(update, context)
-            return
-    
-    await update.message.reply_text("📸 Медиафайл получен, но нет активного процесса.")
-
 # === СИСТЕМА ЗАЯВОК ===
 
-async def start_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Начать подачу заявки"""
     query = update.callback_query
     await query.answer()
 
@@ -591,7 +649,6 @@ async def start_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверка на повторную заявку
     app = await get_last_application(user_id)
     if app:
-        from datetime import datetime, timedelta
         created_at = datetime.strptime(app[13], "%Y-%m-%d %H:%M:%S")
         if datetime.now() - created_at < timedelta(days=7):
             await query.message.reply_text(
@@ -610,7 +667,8 @@ async def start_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=reply_markup
     )
 
-async def set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Установить должность для заявки"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -630,35 +688,8 @@ async def set_position(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     await query.message.reply_text(f"Вы выбрали: {position}\n\n{QUESTIONS[0]}")
 
-async def handle_application_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in USER_APPLICATION:
-        return
-
-    app_data = USER_APPLICATION[user_id]
-    if app_data['step'] >= len(QUESTIONS):
-        return
-
-    app_data['answers'].append(update.message.text)
-    app_data['step'] += 1
-
-    if app_data['step'] < len(QUESTIONS):
-        await update.message.reply_text(QUESTIONS[app_data['step']])
-    else:
-        text = f"📄 Заявка на должность: {app_data['position']}\n\n"
-        for i, q in enumerate(QUESTIONS):
-            text += f"{q}\nОтвет: {app_data['answers'][i]}\n\n"
-
-        keyboard = [
-            [InlineKeyboardButton("✅ Отправить", callback_data="confirm_application")],
-            [InlineKeyboardButton("✏️ Изменить", callback_data="edit_application")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel_application")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(text, reply_markup=reply_markup)
-        app_data['step'] = 'preview'
-
-async def confirm_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Подтвердить заявку"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -703,7 +734,8 @@ async def confirm_application(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_id in USER_APPLICATION:
         del USER_APPLICATION[user_id]
 
-async def edit_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def edit_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Изменить заявку"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -715,7 +747,8 @@ async def edit_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await query.message.reply_text(QUESTIONS[0])
 
-async def cancel_application(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменить заявку"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -723,7 +756,8 @@ async def cancel_application(update: Update, context: ContextTypes.DEFAULT_TYPE)
         del USER_APPLICATION[user_id]
     await query.message.reply_text("🚫 Подача заявки отменена.")
 
-async def handle_application_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_application_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработать действие с заявкой"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -770,7 +804,8 @@ async def handle_application_action(update: Update, context: ContextTypes.DEFAUL
 
 # === АДМИН-ПАНЕЛЬ ===
 
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Админ-панель"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -787,7 +822,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.message.reply_text("👑 Админ-панель:", reply_markup=reply_markup)
 
-async def add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Начать добавление админа"""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -798,19 +834,8 @@ async def add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ADMIN_USER_DATA[user_id] = {'step': 'awaiting_admin_username'}
     await query.message.reply_text("✏️ Отправьте @username пользователя для назначения админом:")
 
-async def handle_admin_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if ADMIN_USER_DATA.get(user_id, {}).get('step') == 'awaiting_admin_username':
-        username = update.message.text.strip()
-        if not username.startswith("@"):
-            await update.message.reply_text("❌ Имя пользователя должно начинаться с @")
-            return
-
-        await add_admin(0, username)
-        await update.message.reply_text(f"✅ Админ {username} добавлен (требуется, чтобы он написал боту /start).")
-        del ADMIN_USER_DATA[user_id]
-
-async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Список админов"""
     query = update.callback_query
     await query.answer()
     
@@ -821,33 +846,206 @@ async def list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "📋 Список администраторов:\n" + "\n".join([f"• {username} (ID: {uid})" for uid, username in admins])
     await query.message.reply_text(text)
 
-# === КОМАНДЫ ===
-
-async def get_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update.message.reply_text(f"🔑 Ваш Telegram ID: `{user.id}`", parse_mode="Markdown")
-
-async def cancel_any_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Вернуться в главное меню"""
+    query = update.callback_query
+    await query.answer()
+    
     user_id = update.effective_user.id
+    is_user_admin = await is_admin(user_id)
+    is_super_admin = user_id == SUPER_ADMIN_ID
+    
+    keyboard = get_main_menu_keyboard(is_user_admin, is_super_admin)
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.reply_text("⬅️ Главное меню:", reply_markup=reply_markup)
 
+# === ОБРАБОТЧИКИ СООБЩЕНИЙ ===
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик текстовых сообщений"""
+    user_id = update.effective_user.id
+    
+    # Обработка ТЗ
     if user_id in USER_DATA:
-        del USER_DATA[user_id]
-        await update.message.reply_text("🚫 Создание ТЗ отменено.")
-    elif user_id in USER_BUG_DATA:
-        del USER_BUG_DATA[user_id]
-        await update.message.reply_text("🚫 Создание бага отменено.")
-    elif user_id in USER_APPLICATION:
-        del USER_APPLICATION[user_id]
-        await update.message.reply_text("🚫 Подача заявки отменена.")
-    elif user_id in ADMIN_USER_DATA:
-        del ADMIN_USER_DATA[user_id]
-        await update.message.reply_text("🚫 Процесс отменён.")
+        step = USER_DATA[user_id].get('step')
+        if step == 'awaiting_description':
+            USER_DATA[user_id]['description'] = update.message.text
+            USER_DATA[user_id]['step'] = 'awaiting_media'
+            await update.message.reply_text("📸 Прикрепите фото/видео (опционально) или отправьте /skip")
+            return
+    
+    # Обработка багов
+    if user_id in USER_BUG_DATA:
+        step = USER_BUG_DATA[user_id].get('step')
+        if step == 'awaiting_description':
+            USER_BUG_DATA[user_id]['description'] = update.message.text
+            USER_BUG_DATA[user_id]['step'] = 'awaiting_media'
+            await update.message.reply_text("📸 Прикрепите скриншот/видео (опционально) или отправьте /skip_bug")
+            return
+    
+    # Обработка заявок
+    if user_id in USER_APPLICATION:
+        step = USER_APPLICATION[user_id].get('step')
+        if isinstance(step, int) and 0 <= step < len(QUESTIONS):
+            app_data = USER_APPLICATION[user_id]
+            app_data['answers'].append(update.message.text)
+            app_data['step'] += 1
+
+            if app_data['step'] < len(QUESTIONS):
+                await update.message.reply_text(QUESTIONS[app_data['step']])
+            else:
+                text = f"📄 Заявка на должность: {app_data['position']}\n\n"
+                for i, q in enumerate(QUESTIONS):
+                    text += f"{q}\nОтвет: {app_data['answers'][i]}\n\n"
+
+                keyboard = [
+                    [InlineKeyboardButton("✅ Отправить", callback_data="confirm_application")],
+                    [InlineKeyboardButton("✏️ Изменить", callback_data="edit_application")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data="cancel_application")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text(text, reply_markup=reply_markup)
+                app_data['step'] = 'preview'
+            return
+    
+    # Обработка админ-панели
+    if user_id in ADMIN_USER_DATA:
+        step = ADMIN_USER_DATA[user_id].get('step')
+        if step == 'awaiting_admin_username':
+            username = update.message.text.strip()
+            if not username.startswith("@"):
+                await update.message.reply_text("❌ Имя пользователя должно начинаться с @")
+                return
+
+            await add_admin(0, username)
+            await update.message.reply_text(f"✅ Админ {username} добавлен (требуется, чтобы он написал боту /start).")
+            del ADMIN_USER_DATA[user_id]
+            return
+    
+    await update.message.reply_text("ℹ️ Начните с команды /start")
+
+async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик медиафайлов"""
+    user_id = update.effective_user.id
+    
+    # Обработка медиа для ТЗ
+    if user_id in USER_DATA:
+        step = USER_DATA[user_id].get('step')
+        if step == 'awaiting_media':
+            if update.message.photo:
+                file_id = update.message.photo[-1].file_id
+                USER_DATA[user_id]['media_file_id'] = file_id
+            elif update.message.video:
+                file_id = update.message.video.file_id
+                USER_DATA[user_id]['media_file_id'] = file_id
+            else:
+                USER_DATA[user_id]['media_file_id'] = None
+
+            await show_task_preview(update, context)
+            return
+    
+    # Обработка медиа для багов
+    if user_id in USER_BUG_DATA:
+        step = USER_BUG_DATA[user_id].get('step')
+        if step == 'awaiting_media':
+            if update.message.photo:
+                file_id = update.message.photo[-1].file_id
+                USER_BUG_DATA[user_id]['media_file_id'] = file_id
+            elif update.message.video:
+                file_id = update.message.video.file_id
+                USER_BUG_DATA[user_id]['media_file_id'] = file_id
+            else:
+                USER_BUG_DATA[user_id]['media_file_id'] = None
+
+            await show_bug_preview(update, context)
+            return
+    
+    await update.message.reply_text("📸 Медиафайл получен, но нет активного процесса.")
+
+async def show_task_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать предпросмотр ТЗ"""
+    user_id = update.effective_user.id
+    data = USER_DATA[user_id]
+    
+    desc = data['description']
+    media = data.get('media_file_id')
+
+    text = f"🔍 Предпросмотр ТЗ:\n\n{desc}"
+    keyboard = [
+        [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_task")],
+        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_task")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_task")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if media:
+        if update.message and update.message.photo:
+            await update.message.reply_photo(photo=media, caption=text, reply_markup=reply_markup)
+        elif update.message and update.message.video:
+            await update.message.reply_video(video=media, caption=text, reply_markup=reply_markup)
+        else:
+            await context.bot.send_photo(chat_id=user_id, photo=media, caption=text, reply_markup=reply_markup)
     else:
-        await update.message.reply_text("ℹ️ Нет активного процесса.")
+        if update.message:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+
+    USER_DATA[user_id]['step'] = 'preview'
+
+async def show_bug_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать предпросмотр бага"""
+    user_id = update.effective_user.id
+    data = USER_BUG_DATA[user_id]
+    
+    desc = data['description']
+    media = data.get('media_file_id')
+
+    text = f"🔍 Предпросмотр бага:\n\n{desc}"
+    keyboard = [
+        [InlineKeyboardButton("✅ Отправить", callback_data="confirm_bug")],
+        [InlineKeyboardButton("✏️ Изменить", callback_data="edit_bug")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="cancel_bug")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if media:
+        if update.message and update.message.photo:
+            await update.message.reply_photo(photo=media, caption=text, reply_markup=reply_markup)
+        elif update.message and update.message.video:
+            await update.message.reply_video(video=media, caption=text, reply_markup=reply_markup)
+        else:
+            await context.bot.send_photo(chat_id=user_id, photo=media, caption=text, reply_markup=reply_markup)
+    else:
+        if update.message:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup)
+
+    USER_BUG_DATA[user_id]['step'] = 'preview'
+
+async def skip_task_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пропустить медиа для ТЗ"""
+    user_id = update.effective_user.id
+    if user_id in USER_DATA and USER_DATA[user_id].get('step') == 'awaiting_media':
+        USER_DATA[user_id]['media_file_id'] = None
+        await show_task_preview(update, context)
+    else:
+        await update.message.reply_text("ℹ️ Нет активного процесса создания ТЗ.")
+
+async def skip_bug_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пропустить медиа для бага"""
+    user_id = update.effective_user.id
+    if user_id in USER_BUG_DATA and USER_BUG_DATA[user_id].get('step') == 'awaiting_media':
+        USER_BUG_DATA[user_id]['media_file_id'] = None
+        await show_bug_preview(update, context)
+    else:
+        await update.message.reply_text("ℹ️ Нет активного процесса создания бага.")
 
 # === ОБРАБОТЧИК КНОПОК ===
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик нажатий кнопок"""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -864,8 +1062,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "confirm_bug": confirm_bug,
         "edit_bug": edit_bug,
         "cancel_bug": cancel_bug,
-        "my_bugs_menu": my_bugs_menu,
-        "admin_bugs_menu": admin_bugs_menu,
         
         # Заявки
         "apply_to_team": start_application,
@@ -893,44 +1089,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === ГЛАВНАЯ ФУНКЦИЯ ===
 
-async def main():
-    # Инициализация БД
-    await init_db()
-
-    # Создаем приложение
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # Команды
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("skip", skip_task_media))
-    application.add_handler(CommandHandler("skip_bug", skip_bug_media))
-    application.add_handler(CommandHandler("cancel", cancel_any_process))
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("id", get_user_id))
-
-    # Обработчики сообщений
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-        handle_text_message
-    ))
-    application.add_handler(MessageHandler(
-        (filters.PHOTO | filters.VIDEO) & filters.ChatType.PRIVATE,
-        handle_media_message
-    ))
-    
-    # Обработчик кнопок
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    logger.info("✅ Бот запущен и готов к работе.")
-    
-    # Запускаем бота
+async def main() -> None:
+    """Главная функция запуска бота"""
     try:
+        # Инициализация БД
+        await init_db()
+
+        # Создаем приложение
+        application = Application.builder().token(BOT_TOKEN).build()
+
+        # Команды
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("skip", skip_task_media))
+        application.add_handler(CommandHandler("skip_bug", skip_bug_media))
+        application.add_handler(CommandHandler("cancel", cancel_any_process))
+        application.add_handler(CommandHandler("admin", admin_panel))
+        application.add_handler(CommandHandler("id", get_user_id))
+
+        # Обработчики сообщений
+        application.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+            handle_text_message
+        ))
+        application.add_handler(MessageHandler(
+            (filters.PHOTO | filters.VIDEO) & filters.ChatType.PRIVATE,
+            handle_media_message
+        ))
+        
+        # Обработчик кнопок
+        application.add_handler(CallbackQueryHandler(button_handler))
+
+        logger.info("✅ Бот запущен и готов к работе.")
+        
+        # Запускаем бота
         await application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True
         )
+        
     except Exception as e:
-        logger.error(f"Ошибка при запуске бота: {e}")
+        logger.error(f"❌ Ошибка при запуске бота: {e}")
         raise
 
 if __name__ == "__main__":
